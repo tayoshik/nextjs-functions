@@ -3,8 +3,8 @@ const { BlobServiceClient } = require('@azure/storage-blob');
 
 // Blob Storage の接続文字列
 const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
-app.http('savePost', {
-    methods: ['POST'], // POST メソッドを処理
+app.http('savePostFallback', {
+    methods: ['POST'],
     authLevel: 'anonymous',
     handler: async (request, context) => {
         try {
@@ -12,13 +12,13 @@ app.http('savePost', {
 
             // リクエストボディを JSON として解析
             const body = await request.json();
-            context.log(`[DEBUG] Request body:`, body);
+            context.log(`[DEBUG] Request body [Fallback]:`, body);
 
             const { threadId, post } = body;
 
             // バリデーション: 必須項目の確認
             if (!threadId || !post || !post.id || !post.name || !post.content) {
-                context.log.error(`[ERROR] Invalid request body:`, body);
+                context.log.error(`[ERROR] Invalid request body [Fallback]:`, body);
                 return {
                     status: 400,
                     jsonBody: {
@@ -30,10 +30,10 @@ app.http('savePost', {
 
             // Blobサービスクライアントの作成
             const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-            const containerClient = blobServiceClient.getContainerClient('threads');
+            const containerClient = blobServiceClient.getContainerClient('threads-backup');  // バックアップ用のコンテナに変更
 
             // Blobを取得
-            const blobClient = containerClient.getBlockBlobClient(`${threadId}.json`);
+            const blobClient = containerClient.getBlockBlobClient(`${threadId}_backup.json`);  // バックアップ用のファイル名
             const exists = await blobClient.exists();
 
             let thread;
@@ -48,33 +48,54 @@ app.http('savePost', {
                 thread = {
                     id: threadId,
                     posts: [],
+                    isBackup: true,  // バックアップフラグを追加
+                    createdAt: new Date().toISOString()
                 };
             }
 
+            // 投稿に追加情報を付与
+            const enhancedPost = {
+                ...post,
+                savedToBackup: true,
+                backupTimestamp: new Date().toISOString()
+            };
+
             // 新しい投稿を追加
-            thread.posts.push(post);
+            thread.posts.push(enhancedPost);
 
             // 更新されたデータをBlobに保存
             const updatedData = JSON.stringify(thread, null, 2);
             await blobClient.upload(Buffer.from(updatedData), updatedData.length, {
-                blobHTTPHeaders: { blobContentType: 'application/json' },
+                blobHTTPHeaders: {
+                    blobContentType: 'application/json',
+                    blobContentEncoding: 'utf-8'
+                },
+                metadata: {
+                    isBackup: 'true',
+                    lastUpdated: new Date().toISOString()
+                }
             });
 
-            context.log(`[DEBUG] Post saved to thread ${threadId}:`, post);
+            context.log(`[DEBUG] Post saved to backup thread ${threadId}:`, enhancedPost);
             return {
                 status: 200,
                 jsonBody: {
-                    message: 'Post Saved',
+                    message: 'Post Saved to Backup',
                     threadId,
-                    post,
+                    post: enhancedPost,
+                    backupInfo: {
+                        containerName: 'threads-backup',
+                        blobName: `${threadId}_backup.json`,
+                        timestamp: new Date().toISOString()
+                    }
                 },
             };
         } catch (error) {
-            context.log.error(`[ERROR] Failed to process request:`, error);
+            context.log.error(`[ERROR] Failed to process backup request:`, error);
             return {
                 status: 500,
                 jsonBody: {
-                    message: 'Internal Server Error',
+                    message: 'Internal Server Error in Backup System',
                     error: error.message,
                 },
             };
