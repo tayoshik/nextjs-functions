@@ -1,89 +1,176 @@
 const { app } = require('@azure/functions');
-const { BlobServiceClient } = require('@azure/storage-blob');
+const { BlobServiceClient, StorageError } = require('@azure/storage-blob');
 
 // Blob Storage の接続文字列
 const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+
 app.http('saveThread', {
-    methods: ['POST'], // POST メソッドを処理
+    methods: ['POST'],
     authLevel: 'anonymous',
     handler: async (request, context) => {
         try {
-            context.log(`[DEBUG] Request method: ${request.method}`);
+            context.log('[DEBUG] Starting saveThread function');
+            context.log('[DEBUG] Request headers:', request.headers);
+
+            // 接続文字列の確認
+            if (!connectionString) {
+                const error = new Error('Storage connection string not configured');
+                error.code = 'MISSING_CONNECTION_STRING';
+                throw error;
+            }
 
             // リクエストボディを JSON として解析
-            const body = await request.json();
-            context.log(`[DEBUG] Request body:`, body);
-
-            const { threadId, title, posts } = body;
-
-            // バリデーション: 必須項目の確認
-            if (!threadId || !title || !Array.isArray(posts)) {
-                context.log.error(`[ERROR] Invalid request body:`, body);
+            let body;
+            try {
+                body = await request.json();
+                context.log('[DEBUG] Request body:', JSON.stringify(body, null, 2));
+            } catch (parseError) {
                 return {
                     status: 400,
                     jsonBody: {
-                        message: 'Invalid Request',
-                        details: 'threadId, title, and a valid posts array are required.',
-                    },
+                        error: 'Invalid JSON',
+                        details: parseError.message,
+                        timestamp: new Date().toISOString()
+                    }
                 };
             }
 
-            // Blobサービスクライアントの作成
-            const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-            const containerClient = blobServiceClient.getContainerClient('threads');
+            const { id, title, timestamp, posts = [] } = body;
 
-            // Blobクライアントの取得
-            const blobClient = containerClient.getBlockBlobClient(`${threadId}.json`);
-            const exists = await blobClient.exists();
+            // バリデーション: 必須項目の確認
+            const missingFields = [];
+            if (!id) missingFields.push('id');
+            if (!title) missingFields.push('title');
+            if (!timestamp) missingFields.push('timestamp');
 
-            let thread;
-
-            if (exists) {
-                // Blobが存在する場合、その内容を取得して解析
-                const downloadResponse = await blobClient.download();
-                const threadData = await streamToString(downloadResponse.readableStreamBody);
-                thread = JSON.parse(threadData);
-
-                // スレッドのタイトルと投稿を更新
-                thread.title = title;
-                thread.posts = posts;
-            } else {
-                // Blobが存在しない場合、新しいスレッドを作成
-                thread = {
-                    id: threadId,
-                    title,
-                    posts,
+            if (missingFields.length > 0) {
+                context.log.error('[ERROR] Missing required fields:', missingFields);
+                return {
+                    status: 400,
+                    jsonBody: {
+                        error: 'Invalid Request',
+                        details: `Missing required fields: ${missingFields.join(', ')}`,
+                        timestamp: new Date().toISOString()
+                    }
                 };
             }
 
-            // 更新されたデータをBlobに保存
-            const updatedData = JSON.stringify(thread, null, 2);
-            await blobClient.upload(Buffer.from(updatedData), updatedData.length, {
-                blobHTTPHeaders: { blobContentType: 'application/json' },
+            try {
+                context.log('[DEBUG] Initializing Blob service client');
+                const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
+                const containerClient = blobServiceClient.getContainerClient('threads');
+
+                // コンテナの存在確認
+                context.log('[DEBUG] Checking container existence');
+                const containerExists = await containerClient.exists();
+                context.log('[DEBUG] Container exists:', containerExists);
+
+                if (!containerExists) {
+                    // コンテナが存在しない場合は作成を試みる
+                    context.log('[INFO] Container does not exist, creating new container');
+                    try {
+                        await containerClient.create();
+                        context.log('[INFO] Container created successfully');
+                    } catch (createError) {
+                        context.log.error('[ERROR] Failed to create container:', createError);
+                        throw createError;
+                    }
+                }
+
+                // Blobクライアントの取得と操作
+                const blobName = `${id}.json`;
+                const blobClient = containerClient.getBlockBlobClient(blobName);
+
+                context.log('[DEBUG] Checking blob existence:', blobName);
+                const exists = await blobClient.exists();
+                context.log('[DEBUG] Blob exists:', exists);
+
+                let thread;
+                if (exists) {
+                    // 既存のBlobの読み取り
+                    context.log('[DEBUG] Retrieving existing thread');
+                    try {
+                        const downloadResponse = await blobClient.download();
+                        const threadData = await streamToString(downloadResponse.readableStreamBody);
+                        thread = JSON.parse(threadData);
+                        context.log('[DEBUG] Existing thread retrieved:', thread);
+                    } catch (readError) {
+                        context.log.error('[ERROR] Failed to read existing thread:', readError);
+                        throw readError;
+                    }
+
+                    // スレッドの更新
+                    thread.title = title;
+                    thread.timestamp = timestamp;
+                    thread.posts = posts;
+                } else {
+                    thread = { id, title, timestamp, posts };
+                }
+
+                // Blobへの保存
+                const updatedData = JSON.stringify(thread, null, 2);
+                context.log('[DEBUG] Saving thread data');
+
+                try {
+                    await blobClient.upload(Buffer.from(updatedData), updatedData.length, {
+                        blobHTTPHeaders: { blobContentType: 'application/json' },
+                    });
+                    context.log('[INFO] Thread saved successfully:', id);
+                } catch (uploadError) {
+                    context.log.error('[ERROR] Failed to upload thread:', uploadError);
+                    throw uploadError;
+                }
+
+                return {
+                    status: exists ? 200 : 201,
+                    jsonBody: {
+                        message: `Thread ${exists ? 'updated' : 'created'} successfully`,
+                        thread,
+                        timestamp: new Date().toISOString()
+                    }
+                };
+
+            } catch (blobError) {
+                if (blobError instanceof StorageError) {
+                    context.log.error('[ERROR] Storage operation failed:', {
+                        code: blobError.code,
+                        message: blobError.message,
+                        details: blobError.details,
+                        statusCode: blobError.statusCode,
+                        stack: blobError.stack
+                    });
+                } else {
+                    context.log.error('[ERROR] Blob operation failed:', {
+                        name: blobError.name,
+                        message: blobError.message,
+                        stack: blobError.stack,
+                        code: blobError.code
+                    });
+                }
+                throw blobError;
+            }
+
+        } catch (error) {
+            context.log.error('[ERROR] Function failed:', {
+                name: error.name,
+                message: error.message,
+                code: error.code,
+                stack: error.stack
             });
 
-            context.log(`[DEBUG] Thread saved: ${threadId}`);
-            return {
-                status: 200,
-                jsonBody: {
-                    message: 'Thread Saved',
-                    thread,
-                },
-            };
-        } catch (error) {
-            context.log.error(`[ERROR] Failed to process request:`, error);
             return {
                 status: 500,
                 jsonBody: {
-                    message: 'Internal Server Error',
-                    error: error.message,
-                },
+                    error: "Internal Server Error",
+                    details: error.message,
+                    code: error.code || 'UNKNOWN_ERROR',
+                    timestamp: new Date().toISOString()
+                }
             };
         }
-    },
+    }
 });
 
-// StreamをStringに変換するユーティリティ関数
 async function streamToString(readableStream) {
     return new Promise((resolve, reject) => {
         const chunks = [];
